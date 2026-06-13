@@ -4,15 +4,16 @@ extension MediaTab {
     @ViewBuilder
     var searchIndexStatus: some View {
         let search = editor.searchIndex
-        switch search.modelState {
-        case .notInstalled where search.enabled && hasIndexableAssets:
-            statusButton(icon: "sparkle.magnifyingglass", label: "Enable smart search") {
-                search.downloadModel()
+        let model = VisualModelLoader.shared
+        switch model.state {
+        case .notInstalled where model.enabled && hasIndexableAssets:
+            statusButton(icon: "sparkle.magnifyingglass", label: "Smart search") {
+                model.download()
             }
-            .help("Downloads a \(modelSizeLabel) on-device model so you can search media.")
+            .help("Downloads a \(modelSizeLabel) on-device model so you can search media visually.")
         case .downloading(let fraction):
             statusIndicator("Downloading \(Int(fraction * 100))%",
-                            help: "Downloading the on-device model that powers smart search.",
+                            help: "Downloading the on-device model that powers visual search.",
                             progress: fraction)
         case .preparing:
             statusIndicator("Preparing…", help: "Getting the search model ready.")
@@ -20,9 +21,9 @@ extension MediaTab {
             statusIndicator("Indexing \(min(search.batchCompleted + 1, search.batchTotal))/\(search.batchTotal)",
                             help: "Analyzing media so you can search it.",
                             progress: search.indexingProgress)
-        case .failed where search.enabled:
-            statusButton(icon: "exclamationmark.triangle", label: "Retry") { search.downloadModel() }
-                .help("Smart search model download failed. Check your connection and try again.")
+        case .failed where model.enabled:
+            statusButton(icon: "exclamationmark.triangle", label: "Retry") { model.download() }
+                .help("Visual search model download failed. Check your connection and try again.")
         default:
             EmptyView()
         }

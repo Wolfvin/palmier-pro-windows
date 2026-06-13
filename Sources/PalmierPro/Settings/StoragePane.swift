@@ -67,7 +67,7 @@ struct StoragePane: View {
                     .controlSize(.small)
                     .labelsHidden()
                     .onChange(of: searchEnabled) { _, newValue in
-                        SearchIndexCoordinator.setEnabled(newValue)
+                        VisualModelLoader.shared.setEnabled(newValue)
                     }
             }
 
@@ -128,7 +128,7 @@ struct StoragePane: View {
 
     private func removeModel() {
         Task {
-            await SearchIndexCoordinator.removeModelGlobally()
+            await VisualModelLoader.shared.remove()
             await refresh()
         }
     }

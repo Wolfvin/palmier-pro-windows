@@ -35,8 +35,8 @@ extension ToolExecutor {
         _ editor: EditorViewModel, query: String, limit: Int, restrict: Set<String>?
     ) async -> [String: Any] {
         let coordinator = editor.searchIndex
-        if coordinator.enabled, coordinator.modelState == .unknown {
-            await coordinator.prepare()
+        if VisualModelLoader.shared.enabled, VisualModelLoader.shared.state == .unknown {
+            await VisualModelLoader.shared.prepare()
         }
 
         var payload: [String: Any] = ["status": Self.visualStatus(coordinator)]
@@ -44,7 +44,7 @@ extension ToolExecutor {
             ($0.type == .video || $0.type == .image) && (restrict?.contains($0.id) ?? true)
         }
         payload["indexableAssets"] = indexable.count
-        if let spec = coordinator.model?.spec {
+        if let spec = VisualModelLoader.shared.embedder?.spec {
             let urls = indexable.map(\.url)
             payload["indexedAssets"] = await Task.detached {
                 urls.filter { !VisualIndexer.needsIndex(url: $0, spec: spec) }.count
@@ -89,8 +89,8 @@ extension ToolExecutor {
     }
 
     private static func visualStatus(_ coordinator: SearchIndexCoordinator) -> String {
-        guard coordinator.enabled else { return "disabled" }
-        switch coordinator.modelState {
+        guard VisualModelLoader.shared.enabled else { return "disabled" }
+        switch VisualModelLoader.shared.state {
         case .ready: return coordinator.indexingActive ? "indexing" : "ready"
         case .notInstalled: return "modelNotInstalled"
         case .downloading: return "downloadingModel"

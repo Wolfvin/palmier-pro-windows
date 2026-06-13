@@ -1,8 +1,6 @@
 import Foundation
 import NaturalLanguage
 
-/// A contextual-embedding model family, each its own 512-dim space — vectors from
-/// different families aren't comparable. CJK is one shared model (zh/ja/ko).
 enum SpokenModel: String, CaseIterable, Sendable {
     case latin = "nlce-latin" // Latin-script languages (e.g., English, Spanish, French)
     case cjk = "nlce-cjk"     // Chinese, Japanese, Korean (CJK languages)
