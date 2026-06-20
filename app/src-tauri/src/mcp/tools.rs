@@ -64,13 +64,17 @@ pub fn all_tools() -> Vec<ToolDescriptor> {
     ]
 }
 
-/// Dispatches a `tools/call` request to the (eventual) tool executor.
+/// Dispatches a `tools/call` request to the editor backend.
 ///
-/// Until the editor backend lands, every call returns a tool-level error
-/// matching the Swift "Editor not available" path. The signature is async so
-/// the future port of `ToolExecutor.swift` can drop in without changing the
-/// call sites in `server.rs`.
-pub async fn dispatch_call(name: &str, _arguments: &Value) -> CallToolResult {
+/// Validates the tool name against [`all_tools`] (mirrors the Swift
+/// `ToolName(rawValue:)` guard), then delegates to
+/// [`crate::editor::tools::dispatch_call`] which locks the global editor
+/// state and routes to the matching tool implementation.
+///
+/// The signature is async because the underlying editor state mutex is a
+/// `tokio::sync::Mutex`; tool implementations themselves are currently
+/// synchronous (no async media pipeline yet).
+pub async fn dispatch_call(name: &str, arguments: &Value) -> CallToolResult {
     // Validate that the requested tool exists — a non-existent tool is a
     // protocol-level error from the client's perspective, but MCP folds it
     // into the tool result as `is_error: true`. We mirror that.
@@ -79,14 +83,9 @@ pub async fn dispatch_call(name: &str, _arguments: &Value) -> CallToolResult {
     if !known.contains(name) {
         return CallToolResult::error(format!("Unknown tool: {name}"));
     }
-    // The editor backend is not yet ported. This mirrors the Swift fallback
-    // (`ToolResult.error("Editor not available")`) so the contract shape stays
-    // correct even before the timeline editor lands.
-    CallToolResult::error(format!(
-        "Tool '{name}' is registered but the editor backend is not yet wired up on the Windows port. \
-         This is expected for the initial Tauri shell PR — see `app/src-tauri/src/mcp/tools.rs` \
-         for the planned port of `ToolExecutor.swift`."
-    ))
+    // Delegate to the editor backend. All 31 tools route to real operations
+    // on the in-memory editor state — see `app/src-tauri/src/editor/tools.rs`.
+    crate::editor::tools::dispatch_call(name, arguments).await
 }
 
 // ---------------------------------------------------------------------------

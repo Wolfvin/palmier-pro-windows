@@ -19,6 +19,7 @@
 //! configured against the macOS build keep working when pointed at the
 //! Windows port.
 
+pub mod editor;
 pub mod generation;
 pub mod logging;
 pub mod mcp;
