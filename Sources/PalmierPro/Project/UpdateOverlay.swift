@@ -3,7 +3,7 @@ import SwiftUI
 /// Shown once over Home after the app updates to a new version.
 struct UpdateOverlay: View {
     let entry: ChangelogEntry
-    let changelogURL: URL
+    let changelogURL: URL?
     let onDismiss: () -> Void
 
     var body: some View {
@@ -32,15 +32,17 @@ struct UpdateOverlay: View {
                 ScrollView { sectionList }
             }
             HStack {
-                Link(destination: changelogURL) {
-                    HStack(spacing: AppTheme.Spacing.xxs) {
-                        Text("Full changelog")
-                        Image(systemName: "arrow.up.right")
+                if let changelogURL {
+                    Link(destination: changelogURL) {
+                        HStack(spacing: AppTheme.Spacing.xxs) {
+                            Text("Full changelog")
+                            Image(systemName: "arrow.up.right")
+                        }
+                        .font(.system(size: AppTheme.FontSize.smMd))
+                        .foregroundStyle(AppTheme.Text.tertiaryColor)
                     }
-                    .font(.system(size: AppTheme.FontSize.smMd))
-                    .foregroundStyle(AppTheme.Text.tertiaryColor)
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
                 Spacer()
                 Button("Continue") { onDismiss() }
                     .buttonStyle(.capsule(.prominent, size: .regular))

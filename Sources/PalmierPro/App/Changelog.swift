@@ -23,7 +23,7 @@ final class ChangelogStore {
     static let shared = ChangelogStore()
 
     private(set) var pending: ChangelogEntry?
-    private(set) var changelogURL = URL(string: "https://github.com/palmier-io/palmier-pro/releases")!
+    private(set) var changelogURL: URL?
 
     private let lastSeenKey = "lastSeenVersion"
 
@@ -34,9 +34,7 @@ final class ChangelogStore {
     /// Show the overlay only on a genuine version change, never on a fresh install
     func checkForWhatsNew() {
         guard let feed = loadFeed() else { return }
-        if let string = feed.changelogURL, let url = URL(string: string) {
-            changelogURL = url
-        }
+        changelogURL = feed.changelogURL.flatMap { URL(string: $0) }
 
         let current = currentVersion
         let lastSeen = UserDefaults.standard.string(forKey: lastSeenKey)
