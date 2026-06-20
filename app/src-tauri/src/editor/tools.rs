@@ -262,15 +262,74 @@ fn tool_search_media(_s: &EditorState, args: &Value) -> CallToolResult {
     }))
 }
 
-fn tool_list_models(_args: &Value) -> CallToolResult {
-    // Model catalog is ported separately (Worker #3). Until it lands, return
-    // `loaded: false` and an empty array so clients retry after sign-in —
-    // matches the Swift `list_models` "loaded=false" contract.
+fn tool_list_models(args: &Value) -> CallToolResult {
+    // Read the static catalog from `crate::generation::models`. The same
+    // source backs `resources/read palmier://models/{video,image}` — the only
+    // difference is that `list_models` calls with `include_type: true` so
+    // each entry carries a `"type": "video"|"image"` field (matches the
+    // Swift `ToolExecutor.videoModelInfo(_, includeType: true)` path).
+    //
+    // Audio and upscale catalogs are NOT ported yet (see PR #5 findings); we
+    // return an empty array for those types but still report `loaded: true`
+    // for the catalog as a whole, because the catalog that IS ported (video +
+    // image) is fully populated. Callers asking for `type: "audio"` see no
+    // models but know the catalog layer is alive (vs. the previous
+    // `loaded: false` placeholder which meant "retry after sign-in").
+    let filter = arg_opt_str(args, "type");
+    let mut models: Vec<Value> = Vec::new();
+    match filter {
+        None => {
+            // No filter -> return every type we have.
+            models.extend(video_models_with_type());
+            models.extend(image_models_with_type());
+        }
+        Some("video") => {
+            models.extend(video_models_with_type());
+        }
+        Some("image") => {
+            models.extend(image_models_with_type());
+        }
+        // Audio / upscale catalogs aren't ported yet — return an empty array
+        // for those types. We still set `loaded: true` (see rationale above).
+        Some("audio") | Some("upscale") => {}
+        Some(other) => {
+            // Unknown filter value. The tool schema restricts the enum to
+            // video|image|audio|upscale, but defense-in-depth: report a
+            // tool-level error so the caller knows the value was rejected.
+            tlog_err!(
+                "editor",
+                "list_models rejected unknown type filter",
+                format!("type={other}")
+            );
+            return err(format!(
+                "Unknown type filter '{other}'. Expected one of: video, image, audio, upscale."
+            ));
+        }
+    }
+
     ok_json(&json!({
-        "models": [],
-        "loaded": false,
-        "note": "Model catalog not yet synced — returns empty list with loaded=false.",
+        "models": models,
+        "loaded": true,
     }))
+}
+
+/// Returns the video catalog as a `Vec<Value>` with `"type": "video"` on each
+/// entry. Thin wrapper around `crate::generation::models::video_models_json_with_type`
+/// so the dispatcher above can append to a single `Vec` regardless of filter.
+fn video_models_with_type() -> Vec<Value> {
+    crate::generation::models::video_models_json_with_type(true)
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Returns the image catalog as a `Vec<Value>` with `"type": "image"` on each
+/// entry.
+fn image_models_with_type() -> Vec<Value> {
+    crate::generation::models::image_models_json_with_type(true)
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
 }
 
 // ===========================================================================
@@ -1855,5 +1914,97 @@ mod tests {
         assert!(obj.contains_key("mediaRef"));
         assert!(obj.contains_key("startFrame"));
         assert!(obj.contains_key("durationFrames"));
+    }
+
+    #[test]
+    fn list_models_returns_loaded_true_with_video_models() {
+        let mut s = EditorState::default();
+        let result = dispatch_inner("list_models", &json!({"type": "video"}), &mut s);
+        assert!(result.is_error.is_none() || result.is_error == Some(false));
+        let body = result.content.first().expect("content");
+        let crate::mcp::protocol::ContentBlock::Text { text } = body else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["loaded"].as_bool(), Some(true), "loaded must be true");
+        let models = v["models"].as_array().unwrap();
+        assert!(models.len() >= 3, "expected >=3 video models, got {}", models.len());
+        for m in models {
+            // list_models uses include_type=true (vs resources/read's false).
+            assert_eq!(m["type"].as_str(), Some("video"), "type field must be 'video'");
+            // Same required fields as resources/read (Swift videoModelInfo).
+            for k in ["id", "displayName", "durations", "aspectRatios",
+                      "supportsFirstFrame", "supportsLastFrame", "supportsReferences"] {
+                assert!(m.as_object().unwrap().contains_key(k),
+                        "video model missing required field: {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn list_models_returns_loaded_true_with_image_models() {
+        let mut s = EditorState::default();
+        let result = dispatch_inner("list_models", &json!({"type": "image"}), &mut s);
+        assert!(result.is_error.is_none() || result.is_error == Some(false));
+        let body = result.content.first().expect("content");
+        let crate::mcp::protocol::ContentBlock::Text { text } = body else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["loaded"].as_bool(), Some(true));
+        let models = v["models"].as_array().unwrap();
+        assert!(models.len() >= 1, "expected >=1 image model, got {}", models.len());
+        for m in models {
+            assert_eq!(m["type"].as_str(), Some("image"));
+            for k in ["id", "displayName", "aspectRatios", "supportsImageReference"] {
+                assert!(m.as_object().unwrap().contains_key(k),
+                        "image model missing required field: {k}");
+            }
+        }
+        // nano-banana-pro is the canonical model ID from the Swift source.
+        let ids: Vec<&str> = models.iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"nano-banana-pro"), "nano-banana-pro missing: {ids:?}");
+    }
+
+    #[test]
+    fn list_models_no_filter_returns_all_ported_types() {
+        let mut s = EditorState::default();
+        let result = dispatch_inner("list_models", &json!({}), &mut s);
+        let crate::mcp::protocol::ContentBlock::Text { text } = result.content.first().unwrap() else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["loaded"].as_bool(), Some(true));
+        let models = v["models"].as_array().unwrap();
+        // 5 video + 3 image = 8 (matches the static catalog in
+        // `generation/models.rs`).
+        assert_eq!(models.len(), 8, "expected 8 models (5 video + 3 image), got {}", models.len());
+        let video_count = models.iter().filter(|m| m["type"].as_str() == Some("video")).count();
+        let image_count = models.iter().filter(|m| m["type"].as_str() == Some("image")).count();
+        assert_eq!(video_count, 5);
+        assert_eq!(image_count, 3);
+    }
+
+    #[test]
+    fn list_models_audio_filter_returns_empty_but_loaded() {
+        // Audio catalog isn't ported yet — empty array, but loaded=true so
+        // clients don't conclude the catalog layer is dead.
+        let mut s = EditorState::default();
+        let result = dispatch_inner("list_models", &json!({"type": "audio"}), &mut s);
+        let crate::mcp::protocol::ContentBlock::Text { text } = result.content.first().unwrap() else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["loaded"].as_bool(), Some(true));
+        assert_eq!(v["models"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_models_rejects_unknown_type_filter() {
+        let mut s = EditorState::default();
+        let result = dispatch_inner("list_models", &json!({"type": "bogus"}), &mut s);
+        assert_eq!(result.is_error, Some(true));
     }
 }
