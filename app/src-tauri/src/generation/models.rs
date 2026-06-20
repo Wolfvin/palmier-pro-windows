@@ -391,10 +391,19 @@ pub static IMAGE_MODELS: &[ImageModelConfig] = &[
 /// `include_type: false` (resource read does NOT include the `type` field —
 /// only `list_models` does).
 pub fn video_models_json() -> Value {
+    video_models_json_with_type(false)
+}
+
+/// Returns the JSON array shape that `list_models` uses for video models.
+/// `include_type: true` adds `"type": "video"` to each entry — matches the
+/// Swift `ToolExecutor.videoModelInfo(_, includeType: true)` path that
+/// `list_models` calls. `resources/read` uses [`video_models_json`] (which
+/// passes `false`) so the `type` field is omitted there.
+pub fn video_models_json_with_type(include_type: bool) -> Value {
     Value::Array(
         VIDEO_MODELS
             .iter()
-            .map(|m| m.to_json(false))
+            .map(|m| m.to_json(include_type))
             .collect(),
     )
 }
@@ -402,10 +411,16 @@ pub fn video_models_json() -> Value {
 /// Returns the JSON array shape that `resources/read` for
 /// `palmier://models/image` returns.
 pub fn image_models_json() -> Value {
+    image_models_json_with_type(false)
+}
+
+/// Returns the JSON array shape that `list_models` uses for image models.
+/// See [`video_models_json_with_type`] for the `include_type` rationale.
+pub fn image_models_json_with_type(include_type: bool) -> Value {
     Value::Array(
         IMAGE_MODELS
             .iter()
-            .map(|m| m.to_json(false))
+            .map(|m| m.to_json(include_type))
             .collect(),
     )
 }
@@ -499,6 +514,11 @@ mod tests {
         let v = video_models_json();
         let arr = v.as_array().expect("video_models_json should return array");
         assert!(arr.len() >= 3, "video catalog should have >= 3 models");
+        // resources/read path (include_type=false) -> no `type` field.
+        for m in arr {
+            assert!(!m.as_object().unwrap().contains_key("type"),
+                "video_models_json must NOT include type field");
+        }
     }
 
     #[test]
@@ -506,6 +526,46 @@ mod tests {
         let v = image_models_json();
         let arr = v.as_array().expect("image_models_json should return array");
         assert!(arr.len() >= 1, "image catalog should have >= 1 model");
+        for m in arr {
+            assert!(!m.as_object().unwrap().contains_key("type"),
+                "image_models_json must NOT include type field");
+        }
+    }
+
+    #[test]
+    fn video_models_json_with_type_includes_type_field() {
+        // list_models path (include_type=true) -> `type: "video"` on every entry.
+        let v = video_models_json_with_type(true);
+        let arr = v.as_array().expect("should return array");
+        assert!(arr.len() >= 3);
+        for m in arr {
+            assert_eq!(m["type"].as_str(), Some("video"));
+        }
+    }
+
+    #[test]
+    fn image_models_json_with_type_includes_type_field() {
+        let v = image_models_json_with_type(true);
+        let arr = v.as_array().expect("should return array");
+        assert!(arr.len() >= 1);
+        for m in arr {
+            assert_eq!(m["type"].as_str(), Some("image"));
+        }
+    }
+
+    #[test]
+    fn video_models_json_with_type_false_matches_video_models_json() {
+        // The legacy accessor must equal the new one with include_type=false.
+        let a = video_models_json();
+        let b = video_models_json_with_type(false);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn image_models_json_with_type_false_matches_image_models_json() {
+        let a = image_models_json();
+        let b = image_models_json_with_type(false);
+        assert_eq!(a, b);
     }
 
     /// Serialize helper to verify the static catalog also round-trips through
