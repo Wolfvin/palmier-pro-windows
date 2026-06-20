@@ -92,25 +92,19 @@ function App() {
     }
   }, [retrying])
 
-  // Initial probe + auto-retry while not connected.
+  // Initial probe on mount. Auto-retry while not connected is handled by
+  // the separate effect below (so that this one only runs once and does
+  // not own an interval).
   useEffect(() => {
     probe()
-    const id = setInterval(() => {
-      setStatus((prev) => {
-        if (prev.state === 'connected') return prev
-        // Trigger a probe by calling probe() outside the updater.
-        return prev
-      })
-    }, RETRY_INTERVAL_MS)
-
     return () => {
-      clearInterval(id)
       abortRef.current?.abort()
     }
   }, [probe])
 
-  // When state is not connected, the interval above should re-probe.
-  // We do this in a separate effect to avoid re-running probe() on every render.
+  // Auto-retry while not connected. Runs its own interval that re-probes
+  // every RETRY_INTERVAL_MS until the state becomes 'connected', at which
+  // point this effect's cleanup clears the interval.
   useEffect(() => {
     if (status.state === 'connected') return
     const id = setInterval(() => {
