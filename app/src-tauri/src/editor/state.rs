@@ -619,6 +619,15 @@ pub fn compact_clip_json(clip: &Clip) -> Value {
                 obj.remove("sourceClipType");
             }
         }
+        // mediaType: "video" is the default — omit it. Audio / text / image
+        // clips keep their `mediaType` so clients can distinguish them.
+        // (Issue #9: this matches the macOS Swift `compactClip` behavior —
+        // `clipDefaults` in `ToolExecutor+Timeline.swift` keeps `mediaType`
+        // in the defaults dict, and `strippingDefaults` removes it when the
+        // value equals the default `.video`.)
+        if obj.get("mediaType").and_then(Value::as_str) == Some("video") {
+            obj.remove("mediaType");
+        }
         // Text clips have no source media — strip trims.
         if obj.get("mediaType").and_then(Value::as_str) == Some("text") {
             obj.remove("trimStartFrame");
