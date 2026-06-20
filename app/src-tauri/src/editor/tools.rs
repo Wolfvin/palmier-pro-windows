@@ -72,18 +72,8 @@ fn arg_opt_i64(args: &Value, key: &str) -> Option<i64> {
     args.get(key).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
 }
 
-fn arg_f64(args: &Value, key: &str) -> Result<f64, String> {
-    args.get(key)
-        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
-        .ok_or_else(|| format!("Missing or invalid '{key}' (expected number)"))
-}
-
 fn arg_opt_f64(args: &Value, key: &str) -> Option<f64> {
     args.get(key).and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
-}
-
-fn arg_opt_bool(args: &Value, key: &str) -> Option<bool> {
-    args.get(key).and_then(Value::as_bool)
 }
 
 fn arg_str_array<'a>(args: &'a Value, key: &str) -> Result<Vec<&'a str>, String> {
