@@ -1,0 +1,65 @@
+[package]
+name = "palmier-pro-windows"
+version = "0.1.0"
+description = "Palmier Pro — Windows port (Tauri v2 + Rust). MCP HTTP server ported from Swift."
+authors = ["Wolfvin <wolfvin@users.noreply.github.com>"]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/Wolfvin/palmier-pro-windows"
+
+# See `KEY` for feature flags:
+#   default      — only the MCP HTTP server + minimal main stub (no system GUI deps)
+#   tauri-shell  — full Tauri v2 GUI shell (requires webkit2gtk-4.1 on Linux,
+#                  WebKit on macOS, WebView2 on Windows). CI / dev boxes with the
+#                  system webview should enable this; headless containers can stay
+#                  on default and still run / test the MCP server.
+
+[lib]
+name = "palmier_pro_windows_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "palmier-pro-windows"
+path = "src/main.rs"
+
+[[bin]]
+name = "mcp-server"
+path = "src/bin/mcp_server.rs"
+
+[features]
+default = []
+# Enables the Tauri GUI shell. Off by default so `cargo build` works on machines
+# without the system webview (e.g. headless CI / containers). When enabled,
+# `cargo tauri dev` will open the empty window per the DoD.
+tauri-shell = ["dep:tauri", "tauri-build"]
+
+[dependencies]
+tauri = { version = "2", optional = true, default-features = false, features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["http1"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-stream = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+tower = "0.5"
+
+[build-dependencies]
+# tauri-build is only needed when the GUI shell is enabled; we declare it as a
+# normal build-dependency because Cargo requires build-dependencies to be
+# resolvable even if a feature that uses them is disabled. It will not be
+# invoked by build.rs unless `tauri-shell` is enabled.
+tauri-build = { version = "2", optional = true }
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
