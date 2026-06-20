@@ -9,8 +9,10 @@ ported.
 
 ```
 app/
-├── frontend/                 # Web frontend (Tauri webview). Empty placeholder —
-│                             # the React/TS UI lands in a follow-up PR.
+├── frontend/                 # Web frontend (React + TS + Vite). Hosts the
+│                             # Tauri webview UI. `npm run dev` listens on
+│                             # 127.0.0.1:1420 (matches `devUrl` in
+│                             # `src-tauri/tauri.conf.json`).
 └── src-tauri/                # Rust backend + Tauri shell
     ├── Cargo.toml            # Crate manifest. `tauri-shell` feature flag
     │                         # gates the GUI build so `cargo build` works on
@@ -36,24 +38,32 @@ app/
 ## Build
 
 ```sh
-# Default build — MCP server only (no system webview required).
-cargo build
+# Default Rust build — MCP server only (no system webview required).
+cd app/src-tauri && cargo build
+
+# Frontend only (no Tauri shell required). Outputs to app/frontend/dist/.
+cd app/frontend && npm install && npm run build
 
 # Full Tauri shell — requires webkit2gtk-4.1 (Linux), WebView2 (Windows),
-# or WebKit (macOS).
-cargo build --features tauri-shell
-cargo tauri dev   # opens the empty Tauri window
+# or WebKit (macOS). `cargo tauri dev` auto-starts `npm run dev` on port
+# 1420 via `beforeDevCommand`.
+cd app/src-tauri && cargo tauri dev --features tauri-shell
 ```
 
 ## Run
 
 ```sh
 # Standalone MCP HTTP server (for headless testing).
-cargo run --bin mcp-server
+cd app/src-tauri && cargo run --bin mcp-server
 # -> listens on http://127.0.0.1:19789/mcp
 
-# Full Tauri app.
-cargo run --features tauri-shell --bin palmier-pro-windows
+# Frontend dev server only (useful for iterating on the React UI without
+# rebuilding the Rust shell).
+cd app/frontend && npm run dev
+# -> http://127.0.0.1:1420 (proxies MCP fetches to 127.0.0.1:19789)
+
+# Full Tauri app (with GUI).
+cd app/src-tauri && cargo run --features tauri-shell --bin palmier-pro-windows
 ```
 
 ## MCP endpoint contract
