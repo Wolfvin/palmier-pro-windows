@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+
+# Tauri build artifacts
+/gen
+/WixTools
+
+# Frontend (will be added in a follow-up PR)
+/node_modules
+/dist

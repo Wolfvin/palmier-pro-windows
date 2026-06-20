@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability set for the Palmier Pro main window. Only the core window APIs are enabled for now — additional capabilities (fs, dialog, shell, ...) should be added in dedicated capability files when the corresponding UI lands.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
