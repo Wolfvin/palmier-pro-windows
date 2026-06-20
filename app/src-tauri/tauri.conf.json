@@ -5,9 +5,9 @@
   "identifier": "io.palmier.pro.windows",
   "build": {
     "frontendDist": "../frontend/dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeDevCommand": "npm --prefix ../frontend run dev",
+    "beforeBuildCommand": "npm --prefix ../frontend run build"
   },
   "app": {
     "windows": [
