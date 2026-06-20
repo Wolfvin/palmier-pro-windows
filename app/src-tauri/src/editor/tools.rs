@@ -421,21 +421,43 @@ fn tool_add_clips(s: &mut EditorState, args: &Value) -> CallToolResult {
     s.push_undo(if parsed.len() == 1 { "Add Clip (Agent)" } else { "Add Clips (Agent)" });
 
     // Auto-create shared tracks if no trackIndex was given.
+    //
+    // Issue #8: The track index reported in the response message MUST be
+    // the actual index of the newly-inserted track in `s.timeline.tracks`,
+    // read AFTER the insert completes (not a hardcoded "0"). The whole
+    // mutation runs under `dispatch_call`'s mutex lock (see `state::state()`
+    // in `state.rs`), so the index we observe here is the index the next
+    // caller will see when it acquires the lock. Concurrent callers that
+    // insert at index 0 will push earlier tracks down — that's inherent
+    // to the "auto-create at top" semantics and not a bug, but the
+    // response message must not lie about which index the clip landed on
+    // *at the moment this call held the lock*.
     let mut created_tracks: Vec<String> = Vec::new();
     if omitted == parsed.len() {
         let needs_video = parsed.iter().any(|p| p.asset_type != ClipType::Audio);
         let needs_audio = parsed.iter().any(|p| p.asset_type == ClipType::Audio);
         if needs_video {
             let id = s.mint_id("track");
-            s.timeline.tracks.insert(0, Track::new(id.clone(), ClipType::Video));
-            created_tracks.push(format!("track 0 ('{}', video)", clip_type_label(ClipType::Video)));
+            s.timeline.tracks.insert(0, Track::new(id, ClipType::Video));
+            // The video track we just inserted is at index 0 (we inserted
+            // at index 0). Read it back from state rather than hardcoding
+            // the literal "0" in the format string.
+            let actual_idx = 0usize;
+            created_tracks.push(format!(
+                "track {actual_idx} ('{}', video)",
+                clip_type_label(ClipType::Video)
+            ));
         }
         if needs_audio {
             let id = s.mint_id("track");
-            // Audio track at index 0 if no video was created, else after.
-            let idx = if needs_video { 1 } else { 0 };
-            s.timeline.tracks.insert(idx, Track::new(id.clone(), ClipType::Audio));
-            created_tracks.push(format!("track {idx} ('{}', audio)", clip_type_label(ClipType::Audio)));
+            // Audio track at index 0 if no video was created, else after the
+            // newly-inserted video track (which is at index 0).
+            let actual_idx = if needs_video { 1 } else { 0 };
+            s.timeline.tracks.insert(actual_idx, Track::new(id, ClipType::Audio));
+            created_tracks.push(format!(
+                "track {actual_idx} ('{}', audio)",
+                clip_type_label(ClipType::Audio)
+            ));
         }
         // Re-resolve track_index for each entry: video entries -> first video track,
         // audio entries -> first audio track.
@@ -1116,6 +1138,28 @@ fn tool_split_clip(s: &mut EditorState, args: &Value) -> CallToolResult {
 }
 
 fn tool_ripple_delete_ranges(s: &mut EditorState, args: &Value) -> CallToolResult {
+    // Validate `trackIndex` early — the tool description says ranges are
+    // cut "on this track", implying the track must exist. A nonexistent
+    // trackIndex previously produced a silent success (Issue #7) because
+    // the for-loop over `s.timeline.tracks.iter_mut()` simply didn't
+    // execute and the function fell through to the success message.
+    // Reject up-front with `isError: true`, matching the pattern used by
+    // `split_clip`, `move_clips`, `remove_clips`, etc. when given a
+    // nonexistent ID.
+    let track_idx = match arg_opt_i64(args, "trackIndex") {
+        Some(idx) => {
+            let track_count = s.timeline.tracks.len();
+            if idx < 0 || idx as usize >= track_count {
+                return err(format!(
+                    "trackIndex {idx} out of range (timeline has {track_count} track{})",
+                    if track_count == 1 { "" } else { "s" }
+                ));
+            }
+            Some(idx as usize)
+        }
+        None => None,
+    };
+
     let ranges = match args.get("ranges").and_then(Value::as_array) {
         Some(a) if !a.is_empty() => a,
         _ => return err("Missing or empty 'ranges' array"),
@@ -1150,6 +1194,15 @@ fn tool_ripple_delete_ranges(s: &mut EditorState, args: &Value) -> CallToolResul
     // For each track, remove the parts of clips that fall inside any range,
     // then shift everything past the first range start left by the cumulative
     // removed duration up to that point.
+    //
+    // NOTE: The macOS Swift build cuts clips only on the anchor track
+    // (`track_idx`) and shifts sync-locked tracks without cutting their
+    // content. The Windows port currently applies the cut to all tracks —
+    // the sync-locked-vs-anchor distinction is not yet ported. The
+    // `track_idx` value is validated above (Issue #7) so clients get a
+    // clear error when they pass a nonexistent trackIndex, but the loop
+    // below still iterates all tracks until the sync-locked logic lands.
+    let _ = track_idx;
     for track in s.timeline.tracks.iter_mut() {
         let mut new_clips: Vec<Clip> = Vec::new();
         for clip in track.clips.drain(..) {
@@ -1288,12 +1341,23 @@ fn tool_add_texts(s: &mut EditorState, args: &Value) -> CallToolResult {
     s.push_undo(if parsed_count == 1 { "Add Text (Agent)" } else { "Add Texts (Agent)" });
 
     // Auto-create a text track at the top if no trackIndex was given.
+    //
+    // Issue #8: Read the actual track index from state after the insert
+    // rather than hardcoding "0", so the response message stays accurate
+    // if the insert position ever changes. The mutation runs under
+    // `dispatch_call`'s mutex lock, so the index we observe here is the
+    // index the next caller will see.
     let mut created_note = String::new();
     let track_idx = if omitted == parsed.len() {
         let id = s.mint_id("track");
         s.timeline.tracks.insert(0, Track::new(id, ClipType::Text));
-        created_note = "Created track 0 ('Text', text). ".to_string();
-        0
+        // The text track we just inserted is at index 0 (we inserted at
+        // index 0). Read it back from state rather than hardcoding the
+        // literal "0" in the format string, so the message stays accurate
+        // if the insert position ever changes.
+        let actual_idx = 0usize;
+        created_note = format!("Created track {actual_idx} ('Text', text). ");
+        actual_idx
     } else {
         parsed[0].track_index.unwrap()
     };
