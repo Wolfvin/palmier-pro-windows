@@ -6,9 +6,31 @@ import './App.css'
  * (see `app/src-tauri/src/mcp/server.rs`). The macOS Swift build binds
  * to the same port + path, so Claude / Cursor / Codex clients configured
  * against macOS keep working when pointed at the Windows port.
+ *
+ * DEV: We fetch through the Vite dev-server proxy (`/mcp-api` →
+ * `http://127.0.0.1:19789`, configured in `vite.config.ts`). The MCP server
+ * is locked to CLI-client use only and intentionally does NOT send CORS
+ * headers — fetching it cross-origin from a browser tab on 127.0.0.1:1420
+ * would be blocked by the browser, leaving the status card stuck on
+ * "Failed" even when the server is healthy. The proxy performs the fetch
+ * same-origin from Vite's dev server, sidestepping CORS without weakening
+ * the MCP server's security posture.
+ *
+ * PROD: There is no Vite dev server in a bundled Tauri build, so the proxy
+ * is not available. The Tauri webview origin in production is
+ * `tauri://localhost` (macOS) / `https://tauri.localhost` (Windows) /
+ * `http://tauri.localhost` (Linux) — a cross-origin fetch to
+ * `http://127.0.0.1:19789` from those origins will hit the same CORS wall
+ * as dev. This is a known follow-up: see the "MCP fetch in production"
+ * section of app/README.md for the tracking note and planned fix
+ * (tauri-plugin-http or a Tauri Rust command that performs the fetch on
+ * the Rust side). For now production builds keep the direct URL so the
+ * status card degrades cleanly to "Failed" rather than 404ing through a
+ * proxy prefix that doesn't exist.
  */
-const MCP_OAUTH_RESOURCE_URL =
-  'http://127.0.0.1:19789/.well-known/oauth-protected-resource'
+const MCP_OAUTH_RESOURCE_URL = import.meta.env.DEV
+  ? '/mcp-api/.well-known/oauth-protected-resource'
+  : 'http://127.0.0.1:19789/.well-known/oauth-protected-resource'
 
 /** Expected shape of the RFC 9728 `oauth-protected-resource` response. */
 interface OAuthProtectedResource {
