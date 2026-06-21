@@ -60,7 +60,15 @@ cd app/src-tauri && cargo run --bin mcp-server
 # Frontend dev server only (useful for iterating on the React UI without
 # rebuilding the Rust shell).
 cd app/frontend && npm run dev
-# -> http://127.0.0.1:1420 (proxies MCP fetches to 127.0.0.1:19789)
+# -> http://127.0.0.1:1420 — MCP fetches are proxied same-origin via the
+#    `/mcp-api` prefix configured in `app/frontend/vite.config.ts` so the
+#    browser never has to talk cross-origin to the MCP server (which is
+#    locked to CLI clients and intentionally sends no CORS headers).
+#    Start the MCP server in a separate terminal
+#    (`cargo run --bin mcp-server` from `app/src-tauri`) before opening
+#    http://127.0.0.1:1420 — otherwise the status card will stay on
+#    "Connecting" / "Failed" with a connection-refused error in the
+#    detail panel.
 
 # Full Tauri app (with GUI).
 cd app/src-tauri && cargo run --features tauri-shell --bin palmier-pro-windows
@@ -116,6 +124,37 @@ curl -s -X POST http://127.0.0.1:19789/mcp \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | jq '.result.tools | length'
 # -> 31
 ```
+
+## MCP fetch in production
+
+The Vite dev-server proxy (`/mcp-api` → `http://127.0.0.1:19789`) only
+exists under `npm run dev` / `cargo tauri dev`. A bundled Tauri build serves
+the frontend from the platform's webview origin instead:
+
+| Platform | Production webview origin          |
+|----------|------------------------------------|
+| macOS    | `tauri://localhost`                |
+| Windows  | `https://tauri.localhost`          |
+| Linux    | `http://tauri.localhost`           |
+
+A `fetch('http://127.0.0.1:19789/.well-known/oauth-protected-resource')`
+from any of those origins is cross-origin (different scheme and/or host),
+so the browser/webview will block it without CORS headers — exactly the
+same failure mode as issue #14 in dev. `App.tsx` therefore keeps the direct
+URL in production builds (gated on `import.meta.env.DEV`); the status card
+will degrade to "Failed" rather than 404 through a proxy prefix that does
+not exist outside the dev server.
+
+This is a **known follow-up**, not a silent assumption of safety:
+
+- The MCP server contract stays locked (no `Access-Control-Allow-Origin`
+  on `/mcp` or `/.well-known/oauth-protected-resource`) — those endpoints
+  expose project timeline / state and must not be reachable from arbitrary
+  browser origins sharing the host.
+- The planned production fix is to route the status probe through a Tauri
+  Rust command (or `tauri-plugin-http`) so the fetch executes from the
+  Rust core, not the webview. That preserves the locked MCP contract and
+  removes the cross-origin fetch entirely. Tracked separately from #14.
 
 ## Port status
 
