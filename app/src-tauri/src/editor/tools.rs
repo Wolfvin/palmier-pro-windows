@@ -1203,13 +1203,27 @@ fn tool_ripple_delete_ranges(s: &mut EditorState, args: &Value) -> CallToolResul
     // clear error when they pass a nonexistent trackIndex, but the loop
     // below still iterates all tracks until the sync-locked logic lands.
     let _ = track_idx;
-    for track in s.timeline.tracks.iter_mut() {
+    // We use index-based track access (`0..track_count`) instead of
+    // `s.timeline.tracks.iter_mut()` so we can call `s.mint_id("clip")`
+    // inside the per-clip segment loop. `mint_id` needs `&mut s`, which
+    // would conflict with the `&mut s.timeline.tracks` borrow that
+    // `iter_mut()` holds for the whole loop body. The `std::mem::take`
+    // below moves the track's clip vec into a local owned binding so no
+    // `&mut s.timeline.tracks[ti]` borrow is alive by the time we reach
+    // the ID-minting step (Issue #15).
+    let track_count = s.timeline.tracks.len();
+    for ti in 0..track_count {
+        let original_clips = std::mem::take(&mut s.timeline.tracks[ti].clips);
         let mut new_clips: Vec<Clip> = Vec::new();
-        for clip in track.clips.drain(..) {
+        for clip in original_clips {
             let c_start = clip.start_frame;
             let c_end = clip.end_frame();
+            let original_id = clip.id.clone();
             // For each range, subtract overlap from the clip.
-            let mut segments = vec![(c_start, c_end, clip.trim_start_frame, clip.clone())];
+            // The initial segment holds the original clip (moved, not
+            // cloned) so we don't carry an extra refcount / share the
+            // same `id` field by accident.
+            let mut segments = vec![(c_start, c_end, clip.trim_start_frame, clip)];
             for (rs, re) in &parsed_ranges {
                 let mut next: Vec<(i64, i64, i64, Clip)> = Vec::new();
                 for (s_start, s_end, s_trim, s_clip) in segments {
@@ -1237,6 +1251,41 @@ fn tool_ripple_delete_ranges(s: &mut EditorState, args: &Value) -> CallToolResul
                 }
                 segments = next;
             }
+            // Assign IDs (Issue #15):
+            //
+            // Before this block, EVERY resulting segment was a `.clone()`
+            // of the original clip — including its `id`. If a range fell
+            // in the middle of a clip, the left and right survivors both
+            // ended up with the same ID, and any downstream
+            // remove_clips / move_clips / set_clip_properties call that
+            // targeted that ID would either hit multiple clips or hit
+            // the wrong one. Multi-range ripples that sliced one clip
+            // into 3+ segments amplified the bug.
+            //
+            // Convention (matches `tool_split_clip` at line ~1127): the
+            // leftmost resulting segment keeps the original clip's ID
+            // (it's treated as the continuation of the original clip),
+            // and every additional segment gets a freshly minted ID via
+            // `s.mint_id("clip")`. Segments are pushed left-to-right
+            // during the range-iteration above (sorted by `start_frame`),
+            // so the first element of `segments` is always the leftmost
+            // survivor — even when the original clip's start falls
+            // inside a deleted range (in which case the first survivor
+            // starts at some `*re` and is the closest thing to the
+            // original clip).
+            //
+            // If no segments survive (clip fully inside a deleted range),
+            // `segments` is empty and this loop is a no-op — no IDs to
+            // assign and no clip to add back.
+            let mut first = true;
+            for (_, _, _, c) in segments.iter_mut() {
+                if first {
+                    c.id = original_id.clone();
+                    first = false;
+                } else {
+                    c.id = s.mint_id("clip");
+                }
+            }
             new_clips.extend(segments.into_iter().map(|(_, _, _, c)| c));
         }
         // Ripple shift: every clip whose start_frame >= the first range's start
@@ -1252,8 +1301,8 @@ fn tool_ripple_delete_ranges(s: &mut EditorState, args: &Value) -> CallToolResul
             }
             clip.start_frame -= shift.min(clip.start_frame);
         }
-        track.clips = new_clips;
-        track.clips.sort_by_key(|c| c.start_frame);
+        s.timeline.tracks[ti].clips = new_clips;
+        s.timeline.tracks[ti].clips.sort_by_key(|c| c.start_frame);
     }
 
     ok(format!(
@@ -2070,5 +2119,323 @@ mod tests {
         let mut s = EditorState::default();
         let result = dispatch_inner("list_models", &json!({"type": "bogus"}), &mut s);
         assert_eq!(result.is_error, Some(true));
+    }
+
+    // ---- Issue #15: ripple_delete_ranges must produce unique clip IDs ----
+
+    /// Helper: seed a single video asset + a single clip on track 0 spanning
+    /// [start_frame, start_frame + duration_frames). Returns the clip's
+    /// actual id (read back from the timeline, so we don't hard-code the
+    /// mint_id offset — `add_clips` mints a "track-N" id first, so the
+    /// first clip id is not always "clip-1").
+    fn seed_single_clip(s: &mut EditorState, duration_frames: i64, start_frame: i64) -> String {
+        s.media_assets.push(MediaAsset {
+            id: "asset-1".into(),
+            name: "Sample".into(),
+            media_type: ClipType::Video,
+            duration: 10.0,
+            folder_id: None,
+            generation_status: "none".into(),
+            generation_input: None,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            source_fps: Some(30.0),
+            has_audio: true,
+        });
+        let args = json!({
+            "entries": [{
+                "mediaRef": "asset-1",
+                "startFrame": start_frame,
+                "durationFrames": duration_frames,
+            }]
+        });
+        let r = dispatch_inner("add_clips", &args, s);
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "add_clips failed: {:?}",
+            r.content
+        );
+        // Read back the actual clip id rather than assuming the mint_id
+        // offset — `add_clips` mints a track id ("track-1") before the
+        // clip id, so the first clip's id depends on the starting
+        // id_counter and is not always "clip-1".
+        let ids = timeline_clip_ids(s);
+        assert_eq!(ids.len(), 1, "seed_single_clip expected 1 clip, got {ids:?}");
+        ids.into_iter().next().unwrap()
+    }
+
+    /// Helper: collect all clip ids from `get_timeline` JSON, in timeline
+    /// order (track-major, then clip-start within track).
+    fn timeline_clip_ids(s: &mut EditorState) -> Vec<String> {
+        let tl = dispatch_inner("get_timeline", &json!({}), s);
+        let body = tl.content.first().expect("content");
+        let crate::mcp::protocol::ContentBlock::Text { text } = body else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        let tracks = v["tracks"].as_array().unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        for track in tracks {
+            for clip in track["clips"].as_array().unwrap() {
+                ids.push(clip["id"].as_str().unwrap().to_string());
+            }
+        }
+        ids
+    }
+
+    /// Helper: given a clip id of the form `clip-N`, return `clip-(N+1)`.
+    /// Used to predict the next id `mint_id("clip")` will produce, so tests
+    /// can assert exact ids without hard-coding the starting `id_counter`
+    /// offset (which depends on how many ids — tracks, clips, etc. — were
+    /// minted before the test reached this point).
+    fn next_clip_id_after(id: &str) -> String {
+        let n: u64 = id
+            .strip_prefix("clip-")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected clip id format: {id}"));
+        format!("clip-{}", n + 1)
+    }
+
+    /// Direct reproduction of the issue #15 scenario: a 60-frame clip and a
+    /// ripple_delete range of [20, 30] must split the clip into two clips
+    /// with DIFFERENT ids. Before the fix, both segments were `.clone()`s of
+    /// the original clip and shared its id, so `remove_clips` on that id
+    /// would remove both, `set_clip_properties` would only touch the first
+    /// match, etc.
+    #[test]
+    fn ripple_delete_middle_range_produces_unique_clip_ids() {
+        let mut s = EditorState::default();
+        let original_id = seed_single_clip(&mut s, 60, 0);
+        let next_id = next_clip_id_after(&original_id);
+
+        let r = dispatch_inner(
+            "ripple_delete_ranges",
+            &json!({ "ranges": [[20, 30]] }),
+            &mut s,
+        );
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "ripple_delete_ranges failed: {:?}",
+            r.content
+        );
+
+        let ids = timeline_clip_ids(&mut s);
+        assert_eq!(
+            ids.len(),
+            2,
+            "expected 2 clips after splitting [0,60) with range [20,30], got {ids:?}"
+        );
+
+        // The leftmost survivor keeps the original id; the new segment gets
+        // the next freshly minted id.
+        assert_eq!(
+            ids[0], original_id,
+            "leftmost survivor should keep the original clip id"
+        );
+        assert_ne!(
+            ids[1], ids[0],
+            "right segment must NOT share the original clip id (issue #15 regression)"
+        );
+        assert_eq!(
+            ids[1], next_id,
+            "first minted id after the original clip should be {next_id}, got {}",
+            ids[1]
+        );
+
+        // Sanity: the two segments should sum back to 50 frames (60 - 10 deleted).
+        let tl = dispatch_inner("get_timeline", &json!({}), &mut s);
+        let body = tl.content.first().unwrap();
+        let crate::mcp::protocol::ContentBlock::Text { text } = body else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        let clips = v["tracks"][0]["clips"].as_array().unwrap();
+        let total: i64 = clips
+            .iter()
+            .map(|c| c["durationFrames"].as_i64().unwrap())
+            .sum();
+        assert_eq!(total, 50, "60f clip with [20,30] removed should leave 50f");
+    }
+
+    /// Cross-check: `remove_clips` on the post-ripple right-segment id must
+    /// remove exactly ONE clip — not both segments. This is the downstream
+    /// symptom issue #15 reports. Before the fix, both segments shared the
+    /// original id, so removing that id wiped the whole track.
+    #[test]
+    fn ripple_delete_then_remove_right_segment_only_removes_one() {
+        let mut s = EditorState::default();
+        let original_id = seed_single_clip(&mut s, 60, 0);
+        let _ = dispatch_inner(
+            "ripple_delete_ranges",
+            &json!({ "ranges": [[20, 30]] }),
+            &mut s,
+        );
+        let ids_after_split = timeline_clip_ids(&mut s);
+        assert_eq!(ids_after_split.len(), 2);
+
+        // The right segment got the freshly minted id. Removing it must
+        // leave exactly one clip — the left segment with the original id.
+        let right_id = ids_after_split[1].clone();
+        let r = dispatch_inner(
+            "remove_clips",
+            &json!({ "clipIds": [right_id] }),
+            &mut s,
+        );
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "remove_clips failed: {:?}",
+            r.content
+        );
+        let ids_after_remove = timeline_clip_ids(&mut s);
+        assert_eq!(
+            ids_after_remove,
+            vec![original_id.clone()],
+            "remove_clips on the right-segment id must leave only the left segment; got {ids_after_remove:?}"
+        );
+    }
+
+    /// Multi-range ripple that slices ONE clip into 3+ segments. Every
+    /// resulting segment must have a unique id. Before the fix, all 3
+    /// segments would share the original clip's id (every split was a
+    /// `.clone()`), so any downstream id-based operation was broken.
+    #[test]
+    fn ripple_delete_multi_range_single_clip_three_segments_unique_ids() {
+        let mut s = EditorState::default();
+        let original_id = seed_single_clip(&mut s, 100, 0);
+        let id_2 = next_clip_id_after(&original_id);
+        let id_3 = next_clip_id_after(&id_2);
+        let id_4 = next_clip_id_after(&id_3);
+
+        // Three non-overlapping ranges inside [0, 100) cut the clip into
+        // four surviving segments: [0,10), [20,40), [50,70), [80,100).
+        let r = dispatch_inner(
+            "ripple_delete_ranges",
+            &json!({ "ranges": [[10, 20], [40, 50], [70, 80]] }),
+            &mut s,
+        );
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "ripple_delete_ranges failed: {:?}",
+            r.content
+        );
+
+        let ids = timeline_clip_ids(&mut s);
+        assert_eq!(
+            ids.len(),
+            4,
+            "expected 4 surviving segments from 3 cuts, got {ids:?}"
+        );
+
+        // Leftmost survivor keeps the original id.
+        assert_eq!(
+            ids[0], original_id,
+            "leftmost survivor should keep the original clip id"
+        );
+
+        // All 4 ids must be unique — this is the core assertion of issue #15.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(
+            sorted.len(),
+            deduped.len(),
+            "all segment ids must be unique; got duplicates in {ids:?}"
+        );
+
+        // Minted ids should be the next three in left-to-right order
+        // (segments are pushed left-to-right during the range loop, and
+        // `mint_id` is called sequentially as we iterate them).
+        assert_eq!(
+            ids[1], id_2,
+            "second segment (left-to-right) should get {id_2}, got {}",
+            ids[1]
+        );
+        assert_eq!(
+            ids[2], id_3,
+            "third segment should get {id_3}, got {}",
+            ids[2]
+        );
+        assert_eq!(
+            ids[3], id_4,
+            "fourth segment should get {id_4}, got {}",
+            ids[3]
+        );
+
+        // Total surviving duration = 100 - 30 = 70.
+        let tl = dispatch_inner("get_timeline", &json!({}), &mut s);
+        let body = tl.content.first().unwrap();
+        let crate::mcp::protocol::ContentBlock::Text { text } = body else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        let clips = v["tracks"][0]["clips"].as_array().unwrap();
+        let total: i64 = clips
+            .iter()
+            .map(|c| c["durationFrames"].as_i64().unwrap())
+            .sum();
+        assert_eq!(
+            total, 70,
+            "100f clip with 3×10f ranges removed should leave 70f"
+        );
+    }
+
+    /// Edge case: ripple_delete range that fully covers the clip's start
+    /// (range begins at or before the clip start). The only survivor is the
+    /// right segment — it should keep the original id (there is no left
+    /// segment to claim it). Verifies the "first survivor keeps original id"
+    /// rule holds when the survivor isn't actually the left part of a split.
+    #[test]
+    fn ripple_delete_range_at_clip_start_survivor_keeps_original_id() {
+        let mut s = EditorState::default();
+        let original_id = seed_single_clip(&mut s, 60, 0);
+
+        let r = dispatch_inner(
+            "ripple_delete_ranges",
+            &json!({ "ranges": [[0, 10]] }),
+            &mut s,
+        );
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "ripple_delete_ranges failed: {:?}",
+            r.content
+        );
+
+        let ids = timeline_clip_ids(&mut s);
+        assert_eq!(
+            ids.len(),
+            1,
+            "range [0,10] on clip [0,60) should leave exactly one segment"
+        );
+        assert_eq!(
+            ids[0], original_id,
+            "the single survivor should keep the original id (no new id minted)"
+        );
+    }
+
+    /// Edge case: ripple_delete range that fully deletes the clip. No
+    /// survivors → no new ids minted, no leftover clips. Verifies we don't
+    /// accidentally push an empty/zero-duration segment.
+    #[test]
+    fn ripple_delete_full_clip_coverage_leaves_no_clips() {
+        let mut s = EditorState::default();
+        let _ = seed_single_clip(&mut s, 60, 0);
+
+        let r = dispatch_inner(
+            "ripple_delete_ranges",
+            &json!({ "ranges": [[0, 60]] }),
+            &mut s,
+        );
+        assert!(
+            r.is_error.is_none() || r.is_error == Some(false),
+            "ripple_delete_ranges failed: {:?}",
+            r.content
+        );
+
+        let ids = timeline_clip_ids(&mut s);
+        assert!(
+            ids.is_empty(),
+            "fully-deleted clip should leave no segments; got {ids:?}"
+        );
     }
 }
