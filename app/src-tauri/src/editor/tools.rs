@@ -951,26 +951,121 @@ fn tool_set_clip_properties(s: &mut EditorState, args: &Value) -> CallToolResult
         }
     }
 
+    // Issue #16: validate numeric fields up-front (before `push_undo` and
+    // before any mutation). Previously these were silently rejected or
+    // silently clamped — `set_clip_properties` returned "Updated 1 clip"
+    // even when no value actually changed, leaving the caller with no way
+    // to detect the no-op. The pattern below mirrors `add_clips`
+    // (line ~357-360) which already rejects invalid `durationFrames`.
+    //
+    // Decision matrix (documented in the PR description):
+    //
+    //   field                              | invalid range          | behaviour
+    //   -----------------------------------+------------------------+----------
+    //   durationFrames                     | < 1                    | REJECT (matches add_clips)
+    //   speed                              | <= 0, NaN, +/-inf      | REJECT (no valid playback semantics)
+    //   trimStartFrame                     | < 0                    | REJECT (no valid negative trim)
+    //   trimEndFrame                       | < 0                    | REJECT (no valid negative trim)
+    //   volume                             | outside [0.0, 1.0]     | CLAMP + disclose in response
+    //   opacity                            | outside [0.0, 1.0]     | CLAMP + disclose in response
+    //
+    // volume/opacity keep clamp (not reject) because [0, 1] is the
+    // physically valid range and clamping to the nearest bound is the
+    // conventional behaviour clients expect (e.g. volume=2.0 -> 1.0 means
+    // "as loud as possible"). The fix is that the clamp is no longer
+    // SILENT — the response message now lists every field that was
+    // clamped, so callers can detect and react.
+    //
+    // Multi-clipIds policy: if ANY field is invalid, the WHOLE call is
+    // rejected with `isError: true` and no clip is mutated. This matches
+    // the existing "Clip not found" / "Text-only fields cannot be applied"
+    // early-reject pattern — partial application would leave the timeline
+    // in an inconsistent state across the requested clips.
+    if let Some(d) = duration_frames {
+        if d < 1 {
+            return err(format!(
+                "durationFrames must be >= 1 (got {d})"
+            ));
+        }
+    }
+    if let Some(t) = trim_start {
+        if t < 0 {
+            return err(format!(
+                "trimStartFrame must be >= 0 (got {t})"
+            ));
+        }
+    }
+    if let Some(t) = trim_end {
+        if t < 0 {
+            return err(format!(
+                "trimEndFrame must be >= 0 (got {t})"
+            ));
+        }
+    }
+    if let Some(sp) = speed {
+        if !sp.is_finite() {
+            return err(format!(
+                "speed must be a finite number (got {sp})"
+            ));
+        }
+        if sp <= 0.0 {
+            return err(format!(
+                "speed must be > 0.0 (got {sp})"
+            ));
+        }
+    }
+    // volume / opacity: track out-of-range so we can disclose the clamp
+    // in the success message. We do NOT reject — see decision matrix above.
+    let mut clamped_notes: Vec<String> = Vec::new();
+    if let Some(v) = volume {
+        if !v.is_finite() {
+            return err(format!(
+                "volume must be a finite number (got {v})"
+            ));
+        }
+        let clamped = v.clamp(0.0, 1.0);
+        if clamped != v {
+            clamped_notes.push(format!(
+                "volume clamped to {clamped} (requested {v})"
+            ));
+        }
+    }
+    if let Some(o) = opacity {
+        if !o.is_finite() {
+            return err(format!(
+                "opacity must be a finite number (got {o})"
+            ));
+        }
+        let clamped = o.clamp(0.0, 1.0);
+        if clamped != o {
+            clamped_notes.push(format!(
+                "opacity clamped to {clamped} (requested {o})"
+            ));
+        }
+    }
+
     s.push_undo(if clip_ids.len() == 1 { "Set Clip Properties (Agent)" } else { "Set Clip Properties (Agent)" });
 
     for (ti, ci) in &locations {
         let clip = &mut s.timeline.tracks[*ti].clips[*ci];
+        // `duration_frames` is already validated >= 1 above; apply directly.
         if let Some(d) = duration_frames {
-            if d >= 1 {
-                clip.duration_frames = d;
-            }
+            clip.duration_frames = d;
         }
+        // `trim_start` / `trim_end` are already validated >= 0 above; apply
+        // directly (no more silent `.max(0)` clamp).
         if let Some(t) = trim_start {
-            clip.trim_start_frame = t.max(0);
+            clip.trim_start_frame = t;
         }
         if let Some(t) = trim_end {
-            clip.trim_end_frame = t.max(0);
+            clip.trim_end_frame = t;
         }
+        // `speed` is already validated > 0 and finite above; apply directly.
         if let Some(sp) = speed {
-            if sp > 0.0 && sp.is_finite() {
-                clip.speed = sp;
-            }
+            clip.speed = sp;
         }
+        // `volume` / `opacity` clamp to [0.0, 1.0] — clamping is intentional
+        // and disclosed in the response message (see `clamped_notes` above).
         if let Some(v) = volume {
             clip.volume = v.clamp(0.0, 1.0);
             // Setting volume clears the volume keyframe track (Swift behavior).
@@ -1018,7 +1113,20 @@ fn tool_set_clip_properties(s: &mut EditorState, args: &Value) -> CallToolResult
         }
     }
 
-    ok(format!("Updated {} clip{}.", clip_ids.len(), if clip_ids.len() == 1 { "" } else { "s" }))
+    // Build the success message. Always starts with the count; if any
+    // volume/opacity value was clamped to [0, 1], append a disclosure
+    // (Issue #16 — clamping is intentional but must not be silent).
+    let mut msg = format!(
+        "Updated {} clip{}.",
+        clip_ids.len(),
+        if clip_ids.len() == 1 { "" } else { "s" }
+    );
+    if !clamped_notes.is_empty() {
+        msg.push_str(" ");
+        msg.push_str(&clamped_notes.join("; "));
+        msg.push('.');
+    }
+    ok(msg)
 }
 
 fn tool_set_keyframes(s: &mut EditorState, args: &Value) -> CallToolResult {
@@ -2164,6 +2272,13 @@ mod tests {
         ids.into_iter().next().unwrap()
     }
 
+    /// Helper (issue #16 tests): seed a single clip on track 0 spanning
+    /// [0, duration_frames). Thin wrapper over `seed_single_clip` so the
+    /// issue #16 tests below don't need to pass a `start_frame`.
+    fn seed_clip_for_props_test(s: &mut EditorState, duration_frames: i64) -> String {
+        seed_single_clip(s, duration_frames, 0)
+    }
+
     /// Helper: collect all clip ids from `get_timeline` JSON, in timeline
     /// order (track-major, then clip-start within track).
     fn timeline_clip_ids(s: &mut EditorState) -> Vec<String> {
@@ -2183,6 +2298,11 @@ mod tests {
         ids
     }
 
+    /// Helper (issue #16 tests): alias of `timeline_clip_ids`.
+    fn clip_ids_from_timeline(s: &mut EditorState) -> Vec<String> {
+        timeline_clip_ids(s)
+    }
+
     /// Helper: given a clip id of the form `clip-N`, return `clip-(N+1)`.
     /// Used to predict the next id `mint_id("clip")` will produce, so tests
     /// can assert exact ids without hard-coding the starting `id_counter`
@@ -2194,6 +2314,22 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| panic!("unexpected clip id format: {id}"));
         format!("clip-{}", n + 1)
+    }
+
+    /// Helper (issue #16 tests): read a single numeric property of the
+    /// first clip on track 0 from `get_timeline` JSON. Returns `None` if
+    /// the field is absent (which is how the compact-JSON serializer
+    /// represents defaults).
+    fn first_clip_field(s: &mut EditorState, field: &str) -> Option<Value> {
+        let tl = dispatch_inner("get_timeline", &json!({}), s);
+        let body = tl.content.first().expect("content");
+        let crate::mcp::protocol::ContentBlock::Text { text } = body else {
+            panic!("expected text content");
+        };
+        let v: Value = serde_json::from_str(text).unwrap();
+        let clips = v["tracks"][0]["clips"].as_array().unwrap();
+        let clip = clips.first().expect("track 0 should have at least one clip");
+        clip.get(field).cloned()
     }
 
     /// Direct reproduction of the issue #15 scenario: a 60-frame clip and a
@@ -2437,5 +2573,361 @@ mod tests {
             ids.is_empty(),
             "fully-deleted clip should leave no segments; got {ids:?}"
         );
+    }
+
+    /// Direct repro from issue #16: `set_clip_properties` with
+    /// `durationFrames=0` previously returned "Updated 1 clip" (success)
+    /// but did not change the clip's duration (silent reject). It must now
+    /// return `isError: true` with a clear message, and the clip's
+    /// `durationFrames` must remain unchanged.
+    #[test]
+    fn set_clip_properties_rejects_duration_frames_below_one() {
+        let mut s = EditorState::default();
+        let clip_id = seed_clip_for_props_test(&mut s, 30);
+        // Sanity: original duration is 30.
+        assert_eq!(
+            first_clip_field(&mut s, "durationFrames")
+                .and_then(|v| v.as_i64())
+                .unwrap(),
+            30
+        );
+
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id], "durationFrames": 0 }),
+            &mut s,
+        );
+        assert_eq!(
+            result_is_error(&r),
+            true,
+            "durationFrames=0 must be rejected (isError=true); got: {:?}",
+            r.content
+        );
+        // The clip's duration must be unchanged (still 30, NOT 0).
+        assert_eq!(
+            first_clip_field(&mut s, "durationFrames")
+                .and_then(|v| v.as_i64())
+                .unwrap(),
+            30,
+            "clip durationFrames must be unchanged after rejected set_clip_properties call"
+        );
+
+        // Negative duration is also rejected.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id], "durationFrames": -5 }),
+            &mut s,
+        );
+        assert_eq!(result_is_error(&r), true);
+        assert_eq!(
+            first_clip_field(&mut s, "durationFrames")
+                .and_then(|v| v.as_i64())
+                .unwrap(),
+            30,
+            "clip durationFrames must still be unchanged after rejected negative-duration call"
+        );
+    }
+
+    /// `speed <= 0` must be rejected. Before the fix, these were silently
+    /// dropped (clip.speed unchanged, but response said "Updated 1 clip" —
+    /// misleading). The `is_finite()` guard also catches NaN / infinity
+    /// defensively if a non-finite f64 ever reaches the dispatcher via a
+    /// code path that bypasses serde_json's strict numeric parsing (which
+    /// itself rejects literal NaN/Infinity at the JSON layer).
+    #[test]
+    fn set_clip_properties_rejects_invalid_speed() {
+        let mut s = EditorState::default();
+        let clip_id = seed_clip_for_props_test(&mut s, 30);
+        // Default speed is 1.0 (which is stripped from the compact JSON
+        // representation), so we first set it to 2.0 to make the
+        // "unchanged after reject" assertion observable.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id.clone()], "speed": 2.0 }),
+            &mut s,
+        );
+        assert!(!result_is_error(&r), "setting speed=2.0 should succeed");
+        assert_eq!(
+            first_clip_field(&mut s, "speed").and_then(|v| v.as_f64()).unwrap(),
+            2.0
+        );
+
+        // speed = 0 -> reject, value unchanged.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id.clone()], "speed": 0.0 }),
+            &mut s,
+        );
+        assert_eq!(
+            result_is_error(&r),
+            true,
+            "speed=0 must be rejected; got: {:?}",
+            r.content
+        );
+        assert_eq!(
+            first_clip_field(&mut s, "speed").and_then(|v| v.as_f64()).unwrap(),
+            2.0,
+            "speed must be unchanged after rejected speed=0 call"
+        );
+
+        // speed = negative -> reject.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id], "speed": -1.0 }),
+            &mut s,
+        );
+        assert_eq!(result_is_error(&r), true);
+        assert_eq!(
+            first_clip_field(&mut s, "speed").and_then(|v| v.as_f64()).unwrap(),
+            2.0,
+            "speed must be unchanged after rejected speed=-1.0 call"
+        );
+    }
+
+    /// `trimStartFrame` and `trimEndFrame` negative must be rejected.
+    /// Before the fix they were silently clamped to 0 (`.max(0)`), so a
+    /// typo like `trimStartFrame: -10` would silently apply 0 and report
+    /// success — the caller had no way to know their value was changed.
+    #[test]
+    fn set_clip_properties_rejects_negative_trim() {
+        let mut s = EditorState::default();
+        let clip_id = seed_clip_for_props_test(&mut s, 30);
+
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id.clone()], "trimStartFrame": -5 }),
+            &mut s,
+        );
+        assert_eq!(
+            result_is_error(&r),
+            true,
+            "trimStartFrame=-5 must be rejected; got: {:?}",
+            r.content
+        );
+
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id], "trimEndFrame": -1 }),
+            &mut s,
+        );
+        assert_eq!(
+            result_is_error(&r),
+            true,
+            "trimEndFrame=-1 must be rejected; got: {:?}",
+            r.content
+        );
+    }
+
+    /// `volume` / `opacity` outside [0.0, 1.0] are CLAMPED (not rejected)
+    /// — clamping to the physically valid range is the conventional
+    /// behaviour for these normalized fields. The fix is that the clamp
+    /// is now disclosed in the success message, so callers can detect it.
+    /// This test verifies the clamp behaviour AND the disclosure.
+    #[test]
+    fn set_clip_properties_clamps_and_discloses_volume_opacity() {
+        let mut s = EditorState::default();
+        let clip_id = seed_clip_for_props_test(&mut s, 30);
+
+        // volume = 2.0 -> clamp to 1.0, success message discloses the clamp.
+        // Note: the compact-JSON serializer strips fields that match their
+        // default values (volume's default is 1.0), so after clamping to
+        // 1.0 the field may be absent from `get_timeline` output. We use
+        // `unwrap_or(1.0)` so the assertion holds whether the field is
+        // present-as-1.0 or stripped-to-default.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id.clone()], "volume": 2.0 }),
+            &mut s,
+        );
+        assert!(
+            !result_is_error(&r),
+            "volume=2.0 should clamp+success, not error; got: {:?}",
+            r.content
+        );
+        assert_eq!(
+            first_clip_field(&mut s, "volume")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0),
+            1.0,
+            "volume=2.0 should clamp to 1.0 (or be stripped as default)"
+        );
+        let msg = result_text(&r);
+        assert!(
+            msg.contains("volume clamped to 1") && msg.contains("requested 2"),
+            "success message should disclose the volume clamp; got: {msg}"
+        );
+
+        // volume = -0.5 -> clamp to 0.0, disclosed. 0.0 is NOT the default
+        // (default is 1.0), so the field is present in the output.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id.clone()], "volume": -0.5 }),
+            &mut s,
+        );
+        assert!(!result_is_error(&r));
+        assert_eq!(
+            first_clip_field(&mut s, "volume").and_then(|v| v.as_f64()).unwrap(),
+            0.0
+        );
+        let msg = result_text(&r);
+        assert!(
+            msg.contains("volume clamped to 0") && msg.contains("requested -0.5"),
+            "success message should disclose the negative volume clamp; got: {msg}"
+        );
+
+        // opacity = 5.0 -> clamp to 1.0, disclosed. opacity's default is
+        // also 1.0, so use `unwrap_or(1.0)` for the same reason as volume.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({ "clipIds": [clip_id], "opacity": 5.0 }),
+            &mut s,
+        );
+        assert!(!result_is_error(&r));
+        assert_eq!(
+            first_clip_field(&mut s, "opacity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0),
+            1.0,
+            "opacity=5.0 should clamp to 1.0 (or be stripped as default)"
+        );
+        let msg = result_text(&r);
+        assert!(
+            msg.contains("opacity clamped to 1") && msg.contains("requested 5"),
+            "success message should disclose the opacity clamp; got: {msg}"
+        );
+    }
+
+    /// Sanity check: in-range values for all the previously-silent fields
+    /// still succeed and update the clip. This guards against the
+    /// regression where the new validation accidentally rejects valid input.
+    #[test]
+    fn set_clip_properties_accepts_valid_values() {
+        let mut s = EditorState::default();
+        let clip_id = seed_clip_for_props_test(&mut s, 30);
+
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({
+                "clipIds": [clip_id],
+                "durationFrames": 45,
+                "speed": 1.5,
+                "volume": 0.8,
+                "opacity": 0.5,
+                "trimStartFrame": 5,
+                "trimEndFrame": 3,
+            }),
+            &mut s,
+        );
+        assert!(
+            !result_is_error(&r),
+            "all-valid set_clip_properties should succeed; got: {:?}",
+            r.content
+        );
+        assert_eq!(
+            first_clip_field(&mut s, "durationFrames")
+                .and_then(|v| v.as_i64())
+                .unwrap(),
+            45
+        );
+        assert_eq!(
+            first_clip_field(&mut s, "speed").and_then(|v| v.as_f64()).unwrap(),
+            1.5
+        );
+        assert_eq!(
+            first_clip_field(&mut s, "volume").and_then(|v| v.as_f64()).unwrap(),
+            0.8
+        );
+        assert_eq!(
+            first_clip_field(&mut s, "opacity").and_then(|v| v.as_f64()).unwrap(),
+            0.5
+        );
+        // The success message should NOT contain any clamp disclosure for
+        // an all-in-range call.
+        let msg = result_text(&r);
+        assert!(
+            !msg.contains("clamped"),
+            "no clamp disclosure expected for in-range values; got: {msg}"
+        );
+    }
+
+    /// Multi-clipIds policy: if ANY field is invalid for the call, the
+    /// WHOLE call is rejected (no partial application). This matches the
+    /// existing "Clip not found" early-reject pattern — partial
+    /// application would leave the timeline in an inconsistent state
+    /// across the requested clips.
+    #[test]
+    fn set_clip_properties_rejects_whole_call_when_any_field_invalid() {
+        let mut s = EditorState::default();
+        // Two clips on the same track (clip A at [0,30), clip B at [30,60)).
+        s.media_assets.push(MediaAsset {
+            id: "asset-1".into(),
+            name: "Sample".into(),
+            media_type: ClipType::Video,
+            duration: 10.0,
+            folder_id: None,
+            generation_status: "none".into(),
+            generation_input: None,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            source_fps: Some(30.0),
+            has_audio: true,
+        });
+        let _ = dispatch_inner(
+            "add_clips",
+            &json!({
+                "entries": [
+                    { "mediaRef": "asset-1", "startFrame": 0,  "durationFrames": 30 },
+                    { "mediaRef": "asset-1", "startFrame": 30, "durationFrames": 30 }
+                ]
+            }),
+            &mut s,
+        );
+        let ids = clip_ids_from_timeline(&mut s);
+        assert_eq!(ids.len(), 2, "expected 2 clips after add_clips");
+        let (id_a, id_b) = (ids[0].clone(), ids[1].clone());
+
+        // durationFrames=0 is invalid -> whole call rejected, neither clip
+        // is mutated.
+        let r = dispatch_inner(
+            "set_clip_properties",
+            &json!({
+                "clipIds": [id_a.clone(), id_b.clone()],
+                "durationFrames": 0,
+                "volume": 0.5
+            }),
+            &mut s,
+        );
+        assert_eq!(
+            result_is_error(&r),
+            true,
+            "durationFrames=0 should reject the whole multi-clip call; got: {:?}",
+            r.content
+        );
+        // Neither clip should have its volume changed.
+        // (Read each clip's volume by removing the other — simpler: just
+        // check the first clip's volume is still the default 1.0.)
+        let vol_a = first_clip_field(&mut s, "volume");
+        // Default volume is 1.0 and stripped from compact JSON, so the
+        // field may be absent. Either way, it must NOT be 0.5.
+        assert_ne!(
+            vol_a.and_then(|v| v.as_f64()),
+            Some(0.5),
+            "clip A volume must be unchanged after rejected multi-clip call"
+        );
+    }
+
+    /// Helper: extract the `isError` flag from a `CallToolResult`.
+    fn result_is_error(r: &CallToolResult) -> bool {
+        r.is_error == Some(true)
+    }
+
+    /// Helper: extract the text content of a `CallToolResult` (the success
+    /// or error message). Panics if the result has no text content.
+    fn result_text(r: &CallToolResult) -> String {
+        let body = r.content.first().expect("content");
+        let crate::mcp::protocol::ContentBlock::Text { text } = body else {
+            panic!("expected text content");
+        };
+        text.clone()
     }
 }
