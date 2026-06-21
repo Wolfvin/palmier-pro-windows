@@ -8,6 +8,7 @@
 
 #[cfg(feature = "tauri-shell")]
 fn main() {
+    use palmier_pro_windows_lib::commands::probe_oauth_protected_resource;
     use palmier_pro_windows_lib::logging;
     use palmier_pro_windows_lib::mcp::{McpServer, McpServerConfig};
 
@@ -20,6 +21,7 @@ fn main() {
     // window opens. A follow-up PR will gate this behind the same
     // "MCP enabled" preference as the macOS build.
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![probe_oauth_protected_resource])
         .setup(|app| {
             let rt = tokio::runtime::Runtime::new().map_err(|err| {
                 eprintln!("[app] failed to create tokio runtime: {err}");
