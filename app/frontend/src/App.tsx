@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import './App.css'
 
 /**
@@ -16,25 +17,33 @@ import './App.css'
  * same-origin from Vite's dev server, sidestepping CORS without weakening
  * the MCP server's security posture.
  *
- * PROD: There is no Vite dev server in a bundled Tauri build, so the proxy
- * is not available. The Tauri webview origin in production is
- * `tauri://localhost` (macOS) / `https://tauri.localhost` (Windows) /
- * `http://tauri.localhost` (Linux) — a cross-origin fetch to
- * `http://127.0.0.1:19789` from those origins will hit the same CORS wall
- * as dev. This is a known follow-up: see the "MCP fetch in production"
- * section of app/README.md for the tracking note and planned fix
- * (tauri-plugin-http or a Tauri Rust command that performs the fetch on
- * the Rust side). For now production builds keep the direct URL so the
- * status card degrades cleanly to "Failed" rather than 404ing through a
- * proxy prefix that doesn't exist.
+ * PROD: The Vite dev-server proxy is not available in a bundled Tauri
+ * build. The Tauri webview origin in production is `tauri://localhost`
+ * (macOS) / `https://tauri.localhost` (Windows) / `http://tauri.localhost`
+ * (Linux) — a cross-origin fetch to `http://127.0.0.1:19789` from those
+ * origins would be blocked by the browser (same CORS wall as dev, since
+ * the MCP server contract does NOT send CORS headers). Instead of a
+ * browser `fetch()`, production uses a Tauri Rust command
+ * (`probe_oauth_protected_resource`) that performs the HTTP GET from the
+ * Rust process (same process as the MCP server). This bypasses the
+ * browser's same-origin policy entirely — there is no cross-origin fetch.
+ * See `app/src-tauri/src/commands/mod.rs` for the command implementation.
  */
-const MCP_OAUTH_RESOURCE_URL = import.meta.env.DEV
-  ? '/mcp-api/.well-known/oauth-protected-resource'
-  : 'http://127.0.0.1:19789/.well-known/oauth-protected-resource'
+const MCP_OAUTH_RESOURCE_URL = '/mcp-api/.well-known/oauth-protected-resource'
 
 /** Expected shape of the RFC 9728 `oauth-protected-resource` response. */
 interface OAuthProtectedResource {
   resource: string
+}
+
+/**
+ * Shape returned by the Tauri `probe_oauth_protected_resource` command.
+ * Must match `ProbeResult` in `app/src-tauri/src/commands/mod.rs`.
+ */
+interface TauriProbeResult {
+  status: number | null
+  body: string | null
+  error: string | null
 }
 
 type ConnectionState = 'connecting' | 'connected' | 'failed'
@@ -73,30 +82,59 @@ function App() {
     }))
 
     try {
-      const res = await fetch(MCP_OAUTH_RESOURCE_URL, {
-        signal: controller.signal,
-        // Long-running MCP clients use the Streamable HTTP transport, but
-        // this probe is a one-shot GET — give it a generous timeout anyway
-        // in case the server is still booting.
-      })
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`)
+      if (import.meta.env.DEV) {
+        // ── DEV: use Vite dev-server proxy (same-origin, no CORS) ──
+        const res = await fetch(MCP_OAUTH_RESOURCE_URL, {
+          signal: controller.signal,
+        })
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status} ${res.statusText}`)
+        }
+        const text = await res.text()
+        let parsed: OAuthProtectedResource | null = null
+        try {
+          parsed = JSON.parse(text) as OAuthProtectedResource
+        } catch {
+          // RFC 9728 says the body MUST be JSON, but we degrade gracefully
+          // and surface the raw body in the detail panel.
+        }
+        const resource = parsed?.resource ?? 'unknown'
+        setStatus({
+          state: 'connected',
+          summary: `Connected — ${resource}`,
+          detail: text,
+          lastCheckedAt: new Date().toISOString(),
+        })
+      } else {
+        // ── PROD: use Tauri Rust command (same-process, no CORS) ──
+        // The invoke() call routes through Tauri's IPC bridge to the Rust
+        // `probe_oauth_protected_resource` command, which performs the
+        // HTTP GET from the Rust process. This avoids the browser's
+        // same-origin policy entirely — there is no browser fetch.
+        const result = await invoke<TauriProbeResult>('probe_oauth_protected_resource')
+
+        if (result.error) {
+          throw new Error(result.error)
+        }
+        if (result.status && result.status >= 400) {
+          throw new Error(`HTTP ${result.status}`)
+        }
+
+        const text = result.body ?? ''
+        let parsed: OAuthProtectedResource | null = null
+        try {
+          parsed = JSON.parse(text) as OAuthProtectedResource
+        } catch {
+          // RFC 9728 says the body MUST be JSON, but we degrade gracefully.
+        }
+        const resource = parsed?.resource ?? 'unknown'
+        setStatus({
+          state: 'connected',
+          summary: `Connected — ${resource}`,
+          detail: text,
+          lastCheckedAt: new Date().toISOString(),
+        })
       }
-      const text = await res.text()
-      let parsed: OAuthProtectedResource | null = null
-      try {
-        parsed = JSON.parse(text) as OAuthProtectedResource
-      } catch {
-        // RFC 9728 says the body MUST be JSON, but we degrade gracefully
-        // and surface the raw body in the detail panel.
-      }
-      const resource = parsed?.resource ?? 'unknown'
-      setStatus({
-        state: 'connected',
-        summary: `Connected — ${resource}`,
-        detail: text,
-        lastCheckedAt: new Date().toISOString(),
-      })
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
         // Superseded by a newer probe — don't surface as failure.
@@ -166,12 +204,14 @@ function App() {
               : 'Not yet checked'}
             {' · '}
             <a
-              href={MCP_OAUTH_RESOURCE_URL}
+              href={import.meta.env.DEV ? MCP_OAUTH_RESOURCE_URL : 'http://127.0.0.1:19789/.well-known/oauth-protected-resource'}
               target="_blank"
               rel="noreferrer"
               style={{ color: '#8ab4f8', textDecoration: 'none' }}
             >
-              {MCP_OAUTH_RESOURCE_URL}
+              {import.meta.env.DEV
+                ? MCP_OAUTH_RESOURCE_URL
+                : 'http://127.0.0.1:19789/.well-known/oauth-protected-resource'}
             </a>
           </span>
           <button

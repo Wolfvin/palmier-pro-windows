@@ -140,21 +140,22 @@ the frontend from the platform's webview origin instead:
 A `fetch('http://127.0.0.1:19789/.well-known/oauth-protected-resource')`
 from any of those origins is cross-origin (different scheme and/or host),
 so the browser/webview will block it without CORS headers — exactly the
-same failure mode as issue #14 in dev. `App.tsx` therefore keeps the direct
-URL in production builds (gated on `import.meta.env.DEV`); the status card
-will degrade to "Failed" rather than 404 through a proxy prefix that does
-not exist outside the dev server.
+same failure mode as issue #14 in dev.
 
-This is a **known follow-up**, not a silent assumption of safety:
+**Fix (issue #20):** production builds use a Tauri Rust command
+(`probe_oauth_protected_resource`) instead of a browser `fetch()`. The
+command runs in the Rust process (same process as the MCP server), so
+there is no cross-origin fetch — the browser's same-origin policy does not
+apply. The MCP server contract stays locked (no `Access-Control-Allow-Origin`
+on `/mcp` or `/.well-known/oauth-protected-resource`).
 
-- The MCP server contract stays locked (no `Access-Control-Allow-Origin`
-  on `/mcp` or `/.well-known/oauth-protected-resource`) — those endpoints
-  expose project timeline / state and must not be reachable from arbitrary
-  browser origins sharing the host.
-- The planned production fix is to route the status probe through a Tauri
-  Rust command (or `tauri-plugin-http`) so the fetch executes from the
-  Rust core, not the webview. That preserves the locked MCP contract and
-  removes the cross-origin fetch entirely. Tracked separately from #14.
+- **Command:** `app/src-tauri/src/commands/mod.rs` —
+  `#[tauri::command] probe_oauth_protected_resource` performs an HTTP GET
+  to `http://127.0.0.1:19789/.well-known/oauth-protected-resource` via
+  `reqwest` and returns `{ status, body, error }` to the frontend.
+- **Frontend:** `App.tsx` branches on `import.meta.env.DEV` — dev uses
+  `fetch()` through the Vite proxy (unchanged from PR #17), production uses
+  `invoke('probe_oauth_protected_resource')` via `@tauri-apps/api/core`.
 
 ## Port status
 
